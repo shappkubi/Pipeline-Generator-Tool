@@ -1,0 +1,123 @@
+trigger: none  # CD is triggered manually or by CI artifact
+
+parameters:
+  - name: environment
+    displayName: "Target Environment"
+    type: string
+    default: "dev"
+    values:
+      - dev
+      - staging
+      - production
+
+variables:
+  APP_NAME: "{{APP_NAME}}"
+  APP_TYPE: "{{APP_TYPE}}"
+  LANGUAGE: "{{LANGUAGE}}"
+  CONTAINER_REGISTRY: "{{CONTAINER_REGISTRY}}"
+  IMAGE_REPOSITORY: "{{APP_NAME}}"
+  IMAGE_TAG: "$(Build.BuildId)"
+  AKS_CLUSTER_NAME: "{{AKS_CLUSTER_NAME}}"
+  AKS_RESOURCE_GROUP: "{{RESOURCE_GROUP}}"
+  K8S_NAMESPACE: "{{APP_NAME}}-${{ parameters.environment }}"
+  HELM_CHART_PATH: "./helm/{{APP_NAME}}"
+  ARTIFACT_NAME: "{{APP_NAME}}-drop"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+  - stage: BuildImage
+    displayName: "Build & Push Docker Image"
+    jobs:
+      - job: DockerBuild
+        displayName: "Docker Build → ACR"
+        steps:
+          - task: DownloadBuildArtifacts@1
+            displayName: "Download Build Artifact"
+            inputs:
+              buildType: "specific"
+              artifactName: "$(ARTIFACT_NAME)"
+              downloadPath: "$(Pipeline.Workspace)"
+
+          - task: Docker@2
+            displayName: "Build Docker Image"
+            inputs:
+              command: "build"
+              containerRegistry: "$(CONTAINER_REGISTRY)"
+              repository: "$(IMAGE_REPOSITORY)"
+              dockerfile: "$(Build.SourcesDirectory)/Dockerfile"
+              tags: |
+                $(IMAGE_TAG)
+                latest
+
+          - task: Docker@2
+            displayName: "Push to Container Registry"
+            inputs:
+              command: "push"
+              containerRegistry: "$(CONTAINER_REGISTRY)"
+              repository: "$(IMAGE_REPOSITORY)"
+              tags: |
+                $(IMAGE_TAG)
+                latest
+
+          - script: |
+              docker scout cves $(CONTAINER_REGISTRY)/$(IMAGE_REPOSITORY):$(IMAGE_TAG) || true
+            displayName: "Container Image Scan (Docker Scout)"
+            continueOnError: true
+
+  - stage: Deploy_${{ parameters.environment }}
+    displayName: "Deploy to AKS [${{ parameters.environment }}]"
+    dependsOn: BuildImage
+    jobs:
+      - deployment: AKSDeployJob
+        displayName: "Helm Upgrade → AKS"
+        environment: "${{ parameters.environment }}"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: "Get AKS Credentials"
+                  inputs:
+                    azureSubscription: "{{AZURE_SERVICE_CONNECTION}}"
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      az aks get-credentials \
+                        --resource-group $(AKS_RESOURCE_GROUP) \
+                        --name $(AKS_CLUSTER_NAME) \
+                        --overwrite-existing
+
+                - script: |
+                    kubectl create namespace $(K8S_NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
+                  displayName: "Ensure Namespace Exists"
+
+                - task: HelmDeploy@0
+                  displayName: "Helm Upgrade / Install"
+                  inputs:
+                    connectionType: "None"
+                    namespace: "$(K8S_NAMESPACE)"
+                    command: "upgrade"
+                    chartType: "FilePath"
+                    chartPath: "$(HELM_CHART_PATH)"
+                    releaseName: "$(APP_NAME)"
+                    overrideValues: |
+                      image.repository=$(CONTAINER_REGISTRY)/$(IMAGE_REPOSITORY)
+                      image.tag=$(IMAGE_TAG)
+                      environment=${{ parameters.environment }}
+                    install: true
+                    waitForExecution: true
+
+                - script: |
+                    kubectl rollout status deployment/$(APP_NAME) \
+                      -n $(K8S_NAMESPACE) --timeout=300s
+                  displayName: "Verify Rollout"
+
+                - script: |
+                    echo "Pods in namespace $(K8S_NAMESPACE):"
+                    kubectl get pods -n $(K8S_NAMESPACE) -l app=$(APP_NAME)
+                    echo ""
+                    echo "Services:"
+                    kubectl get svc -n $(K8S_NAMESPACE)
+                  displayName: "Post-Deploy Status Check"

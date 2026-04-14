@@ -1,0 +1,129 @@
+trigger: none  # CD is triggered manually or by CI artifact
+
+parameters:
+  - name: environment
+    displayName: "Target Environment"
+    type: string
+    default: "dev"
+    values:
+      - dev
+      - staging
+      - production
+
+variables:
+  APP_NAME: "{{APP_NAME}}"
+  APP_TYPE: "{{APP_TYPE}}"
+  LANGUAGE: "{{LANGUAGE}}"
+  ANSIBLE_INVENTORY: "{{ANSIBLE_INVENTORY}}"
+  ANSIBLE_PLAYBOOK: "{{ANSIBLE_PLAYBOOK}}"
+  ANSIBLE_USER: "{{ANSIBLE_USER}}"
+  ANSIBLE_HOSTS_GROUP: "{{ANSIBLE_HOSTS_GROUP}}"
+  DEPLOY_PATH: "/opt/apps/{{APP_NAME}}"
+  ARTIFACT_NAME: "{{APP_NAME}}-drop"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+  - stage: Deploy_${{ parameters.environment }}
+    displayName: "Deploy to On-Prem via Ansible [${{ parameters.environment }}]"
+    jobs:
+      - deployment: AnsibleDeployJob
+        displayName: "Ansible Deploy → {{APP_NAME}}"
+        environment: "${{ parameters.environment }}"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@1
+                  displayName: "Download Build Artifact"
+                  inputs:
+                    buildType: "specific"
+                    artifactName: "$(ARTIFACT_NAME)"
+                    downloadPath: "$(Pipeline.Workspace)"
+
+                - script: |
+                    sudo apt-get update -qq
+                    sudo apt-get install -y ansible sshpass rsync
+                    ansible --version
+                  displayName: "Install Ansible on Agent"
+
+                - task: InstallSSHKey@0
+                  displayName: "Install SSH Key for Remote Hosts"
+                  inputs:
+                    knownHostsEntry: "$(ANSIBLE_KNOWN_HOSTS)"
+                    sshPublicKey: "$(ANSIBLE_SSH_PUBLIC_KEY)"
+                    sshKeySecureFile: "ansible_deploy_key"
+
+                - script: |
+                    # Lint the playbook before running
+                    ansible-playbook $(ANSIBLE_PLAYBOOK) \
+                      -i $(ANSIBLE_INVENTORY) \
+                      --syntax-check \
+                      -e "app_name=$(APP_NAME)" \
+                      -e "environment=${{ parameters.environment }}" \
+                      -e "deploy_path=$(DEPLOY_PATH)" \
+                      -e "artifact_path=$(Pipeline.Workspace)/$(ARTIFACT_NAME)"
+                  displayName: "Playbook Syntax Check"
+
+                - script: |
+                    ansible-playbook $(ANSIBLE_PLAYBOOK) \
+                      -i $(ANSIBLE_INVENTORY) \
+                      --limit "$(ANSIBLE_HOSTS_GROUP)_${{ parameters.environment }}" \
+                      --user $(ANSIBLE_USER) \
+                      --private-key ~/.ssh/ansible_deploy_key \
+                      -e "app_name=$(APP_NAME)" \
+                      -e "app_type=$(APP_TYPE)" \
+                      -e "environment=${{ parameters.environment }}" \
+                      -e "deploy_path=$(DEPLOY_PATH)" \
+                      -e "artifact_path=$(Pipeline.Workspace)/$(ARTIFACT_NAME)" \
+                      -e "build_id=$(Build.BuildId)" \
+                      --diff \
+                      -v
+                  displayName: "Run Ansible Deploy Playbook"
+
+                - script: |
+                    # Run a dedicated health-check playbook or inline task
+                    ansible $(ANSIBLE_HOSTS_GROUP)_${{ parameters.environment }} \
+                      -i $(ANSIBLE_INVENTORY) \
+                      --user $(ANSIBLE_USER) \
+                      --private-key ~/.ssh/ansible_deploy_key \
+                      -m uri \
+                      -a "url=http://{{ inventory_hostname }}/health \
+                          method=GET \
+                          status_code=200 \
+                          timeout=15"
+                  displayName: "Health Check via Ansible URI Module"
+                  continueOnError: false
+
+                - script: |
+                    echo "==== Deployment Summary ===="
+                    echo "App      : $(APP_NAME)"
+                    echo "Type     : $(APP_TYPE)"
+                    echo "Env      : ${{ parameters.environment }}"
+                    echo "Build    : $(Build.BuildId)"
+                    echo "Hosts    : $(ANSIBLE_HOSTS_GROUP)_${{ parameters.environment }}"
+                    echo "Path     : $(DEPLOY_PATH)"
+                    echo "============================"
+                  displayName: "Print Deployment Summary"
+
+  - stage: Rollback
+    displayName: "Rollback (on failure)"
+    dependsOn: Deploy_${{ parameters.environment }}
+    condition: failed()
+    jobs:
+      - job: RollbackJob
+        displayName: "Rollback Previous Version"
+        steps:
+          - script: |
+              ansible-playbook $(ANSIBLE_PLAYBOOK) \
+                -i $(ANSIBLE_INVENTORY) \
+                --limit "$(ANSIBLE_HOSTS_GROUP)_${{ parameters.environment }}" \
+                --user $(ANSIBLE_USER) \
+                --private-key ~/.ssh/ansible_deploy_key \
+                -e "app_name=$(APP_NAME)" \
+                -e "environment=${{ parameters.environment }}" \
+                -e "deploy_path=$(DEPLOY_PATH)" \
+                -e "rollback=true" \
+                -v
+            displayName: "Rollback to Previous Stable Build"

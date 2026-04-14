@@ -1,0 +1,135 @@
+trigger: none  # CD is triggered manually or by CI artifact
+
+parameters:
+  - name: environment
+    displayName: "Target Environment"
+    type: string
+    default: "dev"
+    values:
+      - dev
+      - staging
+      - production
+
+variables:
+  APP_NAME: "{{APP_NAME}}"
+  APP_TYPE: "{{APP_TYPE}}"
+  LANGUAGE: "{{LANGUAGE}}"
+  AZURE_SUBSCRIPTION: "{{AZURE_SERVICE_CONNECTION}}"
+  RESOURCE_GROUP: "{{RESOURCE_GROUP}}"
+  APP_SERVICE_NAME: "{{APP_NAME}}-${{ parameters.environment }}"
+  APP_SERVICE_PLAN: "{{APP_NAME}}-plan"
+  ARTIFACT_NAME: "{{APP_NAME}}-drop"
+  SLOT_NAME: "staging"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+  - stage: Deploy_${{ parameters.environment }}
+    displayName: "Deploy to Azure App Service [${{ parameters.environment }}]"
+    jobs:
+      - deployment: AzureDeployJob
+        displayName: "Deploy {{APP_NAME}} → Azure App Service"
+        environment: "${{ parameters.environment }}"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@1
+                  displayName: "Download Build Artifact"
+                  inputs:
+                    buildType: "specific"
+                    artifactName: "$(ARTIFACT_NAME)"
+                    downloadPath: "$(Pipeline.Workspace)"
+
+                - task: AzureCLI@2
+                  displayName: "Verify App Service Exists"
+                  inputs:
+                    azureSubscription: "$(AZURE_SUBSCRIPTION)"
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      az webapp show \
+                        --resource-group $(RESOURCE_GROUP) \
+                        --name $(APP_SERVICE_NAME) \
+                        --output table
+
+                - task: AzureWebApp@1
+                  displayName: "Deploy to Staging Slot"
+                  inputs:
+                    azureSubscription: "$(AZURE_SUBSCRIPTION)"
+                    appType: "webApp"
+                    appName: "$(APP_SERVICE_NAME)"
+                    deployToSlotOrASE: true
+                    resourceGroupName: "$(RESOURCE_GROUP)"
+                    slotName: "$(SLOT_NAME)"
+                    package: "$(Pipeline.Workspace)/$(ARTIFACT_NAME)/**/*.zip"
+                    deploymentMethod: "auto"
+
+                - task: AzureCLI@2
+                  displayName: "Configure App Settings"
+                  inputs:
+                    azureSubscription: "$(AZURE_SUBSCRIPTION)"
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      az webapp config appsettings set \
+                        --resource-group $(RESOURCE_GROUP) \
+                        --name $(APP_SERVICE_NAME) \
+                        --slot $(SLOT_NAME) \
+                        --settings \
+                          ASPNETCORE_ENVIRONMENT=${{ parameters.environment }} \
+                          APP_VERSION=$(Build.BuildId)
+
+                - task: AzureCLI@2
+                  displayName: "Health Check on Staging Slot"
+                  inputs:
+                    azureSubscription: "$(AZURE_SUBSCRIPTION)"
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      SLOT_URL="https://$(APP_SERVICE_NAME)-$(SLOT_NAME).azurewebsites.net/health"
+                      echo "Checking health at: $SLOT_URL"
+
+                      for i in {1..5}; do
+                        STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$SLOT_URL" --max-time 15)
+                        if [ "$STATUS" = "200" ]; then
+                          echo "Health check passed (attempt $i)"
+                          exit 0
+                        fi
+                        echo "Attempt $i: HTTP $STATUS — retrying in 15s..."
+                        sleep 15
+                      done
+                      echo "Health check failed after 5 attempts"
+                      exit 1
+
+                - task: AzureAppServiceManage@0
+                  displayName: "Swap Slots (staging → production)"
+                  inputs:
+                    azureSubscription: "$(AZURE_SUBSCRIPTION)"
+                    Action: "Swap Slots"
+                    WebAppName: "$(APP_SERVICE_NAME)"
+                    ResourceGroupName: "$(RESOURCE_GROUP)"
+                    SourceSlot: "$(SLOT_NAME)"
+
+                - task: AzureCLI@2
+                  displayName: "Post-Swap Health Check (Production)"
+                  inputs:
+                    azureSubscription: "$(AZURE_SUBSCRIPTION)"
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      PROD_URL="https://$(APP_SERVICE_NAME).azurewebsites.net/health"
+                      echo "Verifying production at: $PROD_URL"
+
+                      for i in {1..3}; do
+                        STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PROD_URL" --max-time 15)
+                        if [ "$STATUS" = "200" ]; then
+                          echo "Production health check PASSED"
+                          exit 0
+                        fi
+                        echo "Attempt $i: HTTP $STATUS"
+                        sleep 10
+                      done
+                      echo "Production health check failed — consider rollback"
+                      exit 1

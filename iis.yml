@@ -1,0 +1,101 @@
+trigger: none  # CD is triggered manually or by CI artifact
+
+parameters:
+  - name: environment
+    displayName: "Target Environment"
+    type: string
+    default: "dev"
+    values:
+      - dev
+      - staging
+      - production
+
+variables:
+  APP_NAME: "{{APP_NAME}}"
+  APP_TYPE: "{{APP_TYPE}}"
+  LANGUAGE: "{{LANGUAGE}}"
+  IIS_SERVER: "{{IIS_SERVER}}"
+  IIS_SITE_NAME: "{{IIS_SITE_NAME}}"
+  IIS_APP_POOL: "{{APP_NAME}}-AppPool"
+  DEPLOY_PATH: "C:\\inetpub\\wwwroot\\{{APP_NAME}}"
+  ARTIFACT_NAME: "{{APP_NAME}}-drop"
+
+pool:
+  name: "SelfHosted-Windows"   # IIS deploy requires Windows agent on target network
+
+stages:
+  - stage: Deploy_${{ parameters.environment }}
+    displayName: "Deploy to IIS [${{ parameters.environment }}]"
+    jobs:
+      - deployment: IISDeployJob
+        displayName: "Deploy {{APP_NAME}} → IIS"
+        environment: "${{ parameters.environment }}"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@1
+                  displayName: "Download Build Artifact"
+                  inputs:
+                    buildType: "specific"
+                    artifactName: "$(ARTIFACT_NAME)"
+                    downloadPath: "$(Pipeline.Workspace)"
+
+                - task: PowerShell@2
+                  displayName: "Stop App Pool"
+                  inputs:
+                    targetType: "inline"
+                    script: |
+                      Import-Module WebAdministration
+                      $appPool = "$(IIS_APP_POOL)"
+                      if ((Get-WebAppPoolState -Name $appPool).Value -eq "Started") {
+                          Stop-WebAppPool -Name $appPool
+                          Write-Host "Stopped App Pool: $appPool"
+                          Start-Sleep -Seconds 5
+                      } else {
+                          Write-Host "App Pool already stopped."
+                      }
+
+                - task: IISWebAppDeploymentOnMachineGroup@0
+                  displayName: "Deploy via Web Deploy (MSDeploy)"
+                  inputs:
+                    WebSiteName: "$(IIS_SITE_NAME)"
+                    Package: "$(Pipeline.Workspace)/$(ARTIFACT_NAME)/**/*.zip"
+                    RemoveAdditionalFilesFlag: true
+                    TakeAppOfflineFlag: true
+                    XmlTransformation: false
+                    XmlVariableSubstitution: true
+
+                - task: PowerShell@2
+                  displayName: "Start App Pool"
+                  inputs:
+                    targetType: "inline"
+                    script: |
+                      Import-Module WebAdministration
+                      $appPool = "$(IIS_APP_POOL)"
+                      Start-WebAppPool -Name $appPool
+                      Write-Host "Started App Pool: $appPool"
+
+                - task: PowerShell@2
+                  displayName: "Health Check"
+                  inputs:
+                    targetType: "inline"
+                    script: |
+                      $url = "http://$(IIS_SERVER)/$(APP_NAME)/health"
+                      $maxRetries = 5
+                      $retryInterval = 10
+
+                      for ($i = 1; $i -le $maxRetries; $i++) {
+                          try {
+                              $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 15
+                              if ($response.StatusCode -eq 200) {
+                                  Write-Host "Health check passed on attempt $i"
+                                  exit 0
+                              }
+                          } catch {
+                              Write-Warning "Attempt $i failed: $($_.Exception.Message)"
+                              if ($i -lt $maxRetries) { Start-Sleep -Seconds $retryInterval }
+                          }
+                      }
+                      Write-Error "Health check failed after $maxRetries attempts"
+                      exit 1
