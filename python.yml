@@ -1,0 +1,104 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - release/*
+
+variables:
+  APP_NAME: "{{APP_NAME}}"
+  APP_TYPE: "{{APP_TYPE}}"
+  PYTHON_VERSION: "3.11"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+  - stage: Build
+    displayName: "Build & Test"
+    jobs:
+      - job: BuildJob
+        displayName: "Build {{APP_NAME}}"
+        steps:
+          - task: UsePythonVersion@0
+            displayName: "Set Python Version"
+            inputs:
+              versionSpec: "$(PYTHON_VERSION)"
+              addToPath: true
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+            displayName: "Install Dependencies"
+
+          - script: |
+              pip install flake8 pylint
+              flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+              flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+            displayName: "Lint with Flake8"
+            continueOnError: true
+
+          - script: |
+              pip install pytest pytest-cov
+              pytest tests/ --cov=. --cov-report=xml --cov-report=html -v
+            displayName: "Run Tests with Coverage"
+
+          - task: PublishCodeCoverageResults@1
+            displayName: "Publish Code Coverage"
+            inputs:
+              codeCoverageTool: "Cobertura"
+              summaryFileLocation: "$(System.DefaultWorkingDirectory)/coverage.xml"
+
+  - stage: SecurityScan
+    displayName: "Security & Quality"
+    dependsOn: Build
+    jobs:
+      - job: ScanJob
+        displayName: "SAST & Dependency Scan"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(PYTHON_VERSION)"
+
+          - script: |
+              pip install bandit safety
+              bandit -r . -f json -o bandit-report.json --exit-zero
+              safety check --full-report
+            displayName: "Run Bandit & Safety Scan"
+            continueOnError: true
+
+  - stage: Publish
+    displayName: "Package Artifact"
+    dependsOn: SecurityScan
+    jobs:
+      - job: PublishJob
+        displayName: "Package {{APP_NAME}}"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "$(PYTHON_VERSION)"
+
+          - script: |
+              pip install --upgrade build wheel
+              python -m build
+            displayName: "Build Package"
+            continueOnError: true
+
+          - task: CopyFiles@2
+            displayName: "Stage Application Files"
+            inputs:
+              SourceFolder: "$(System.DefaultWorkingDirectory)"
+              Contents: |
+                **/*.py
+                requirements.txt
+                Dockerfile
+                !**/__pycache__/**
+                !**/*.pyc
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Upload Build Artifact"
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+              ArtifactName: "{{APP_NAME}}-drop"
+              publishLocation: "Container"

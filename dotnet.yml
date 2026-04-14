@@ -1,0 +1,107 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - release/*
+
+variables:
+  APP_NAME: "{{APP_NAME}}"
+  APP_TYPE: "{{APP_TYPE}}"
+  BUILD_CONFIGURATION: "Release"
+  DOTNET_VERSION: "8.0.x"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+  - stage: Build
+    displayName: "Build & Test"
+    jobs:
+      - job: BuildJob
+        displayName: "Build {{APP_NAME}}"
+        steps:
+          - task: UseDotNet@2
+            displayName: "Install .NET SDK"
+            inputs:
+              packageType: "sdk"
+              version: "$(DOTNET_VERSION)"
+
+          - task: DotNetCoreCLI@2
+            displayName: "Restore NuGet Packages"
+            inputs:
+              command: "restore"
+              projects: "**/*.csproj"
+
+          - task: DotNetCoreCLI@2
+            displayName: "Build Solution"
+            inputs:
+              command: "build"
+              projects: "**/*.csproj"
+              arguments: "--configuration $(BUILD_CONFIGURATION) --no-restore"
+
+          - task: DotNetCoreCLI@2
+            displayName: "Run Unit Tests"
+            inputs:
+              command: "test"
+              projects: "**/*Tests/*.csproj"
+              arguments: "--configuration $(BUILD_CONFIGURATION) --no-build --collect:\"XPlat Code Coverage\""
+
+          - task: PublishCodeCoverageResults@1
+            displayName: "Publish Code Coverage"
+            inputs:
+              codeCoverageTool: "Cobertura"
+              summaryFileLocation: "$(Agent.TempDirectory)/**/coverage.cobertura.xml"
+
+  - stage: SecurityScan
+    displayName: "Security & Quality"
+    dependsOn: Build
+    jobs:
+      - job: ScanJob
+        displayName: "SAST & Dependency Scan"
+        steps:
+          - task: UseDotNet@2
+            inputs:
+              packageType: "sdk"
+              version: "$(DOTNET_VERSION)"
+
+          - script: |
+              dotnet tool install --global security-scan
+              security-scan **/*.csproj --export=sarif
+            displayName: "Run Security Scan"
+            continueOnError: true
+
+          - task: DotNetCoreCLI@2
+            displayName: "Check for Vulnerable Packages"
+            inputs:
+              command: "custom"
+              custom: "list"
+              arguments: "package --vulnerable --include-transitive"
+            continueOnError: true
+
+  - stage: Publish
+    displayName: "Package Artifact"
+    dependsOn: SecurityScan
+    jobs:
+      - job: PublishJob
+        displayName: "Publish {{APP_NAME}}"
+        steps:
+          - task: UseDotNet@2
+            inputs:
+              packageType: "sdk"
+              version: "$(DOTNET_VERSION)"
+
+          - task: DotNetCoreCLI@2
+            displayName: "Publish Application"
+            inputs:
+              command: "publish"
+              publishWebProjects: true
+              arguments: "--configuration $(BUILD_CONFIGURATION) --output $(Build.ArtifactStagingDirectory)"
+              zipAfterPublish: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Upload Build Artifact"
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+              ArtifactName: "{{APP_NAME}}-drop"
+              publishLocation: "Container"

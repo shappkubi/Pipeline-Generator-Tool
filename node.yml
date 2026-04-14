@@ -1,0 +1,106 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - release/*
+
+variables:
+  APP_NAME: "{{APP_NAME}}"
+  APP_TYPE: "{{APP_TYPE}}"
+  NODE_VERSION: "20.x"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+  - stage: Build
+    displayName: "Build & Test"
+    jobs:
+      - job: BuildJob
+        displayName: "Build {{APP_NAME}}"
+        steps:
+          - task: NodeTool@0
+            displayName: "Install Node.js"
+            inputs:
+              versionSpec: "$(NODE_VERSION)"
+
+          - script: npm ci
+            displayName: "Install Dependencies (npm ci)"
+
+          - script: |
+              npm run lint --if-present
+            displayName: "Lint Code"
+            continueOnError: true
+
+          - script: |
+              npm test -- --coverage --ci --reporters=default --reporters=jest-junit
+            displayName: "Run Tests with Coverage"
+            env:
+              CI: "true"
+
+          - task: PublishTestResults@2
+            displayName: "Publish Test Results"
+            inputs:
+              testResultsFiles: "junit.xml"
+              testRunTitle: "{{APP_NAME}} Tests"
+            condition: always()
+
+          - script: |
+              npm run build --if-present
+            displayName: "Build Application"
+
+  - stage: SecurityScan
+    displayName: "Security & Quality"
+    dependsOn: Build
+    jobs:
+      - job: ScanJob
+        displayName: "Dependency & SAST Scan"
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: "$(NODE_VERSION)"
+
+          - script: |
+              npm audit --audit-level=high
+            displayName: "NPM Audit"
+            continueOnError: true
+
+          - script: |
+              npx semgrep --config=auto . --json > semgrep-report.json || true
+            displayName: "Semgrep SAST Scan"
+            continueOnError: true
+
+  - stage: Publish
+    displayName: "Package Artifact"
+    dependsOn: SecurityScan
+    jobs:
+      - job: PublishJob
+        displayName: "Package {{APP_NAME}}"
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: "$(NODE_VERSION)"
+
+          - script: npm ci --omit=dev
+            displayName: "Install Production Dependencies"
+
+          - task: CopyFiles@2
+            displayName: "Stage Application Files"
+            inputs:
+              SourceFolder: "$(System.DefaultWorkingDirectory)"
+              Contents: |
+                **/*
+                !node_modules/**
+                !**/*.test.*
+                !**/*.spec.*
+                !coverage/**
+                !.git/**
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Upload Build Artifact"
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)"
+              ArtifactName: "{{APP_NAME}}-drop"
+              publishLocation: "Container"
